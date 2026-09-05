@@ -65,6 +65,9 @@ tailwind.config = {
   .speak-btn:hover{ background:#d4e8e1; }
   .speak-btn:active{ transform:scale(.92); }
   .speak-btn.playing{ background:#2F7D6E; color:#fff; }
+  .speak-btn.loading{ background:#E4F0EC; color:#2F7D6E; }
+  .speak-btn .ico-spin{ animation:spin .8s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
   .speak-btn svg{ width:1rem; height:1rem; }
   .speak-btn:focus-visible{ outline:2px solid #2F7D6E; outline-offset:2px; }
   /* the currently spoken word */
@@ -93,10 +96,11 @@ tailwind.config = {
       <span class="inline-flex items-center gap-2 bg-band text-ink/70 rounded-full px-3 py-1"><span class="chunk px-1">螢光黃</span>＝核心語塊</span>
       <span class="inline-flex items-center gap-2 bg-tealsoft text-teal rounded-full px-3 py-1">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>
-        點喇叭聽英式發音（會逐字跟讀）
+        單字＝美式真人發音｜例句＝美式朗讀跟讀
       </span>
     </div>
     <p id="speech-warn" class="zh text-sm text-rose mt-3 hidden">⚠ 目前的瀏覽器不支援語音朗讀，建議改用 Chrome、Edge 或 Safari 開啟本頁。</p>
+    <p class="zh text-xs text-ink/45 mt-2">💡 單字發音為線上真人音檔（需連網）；少數字典查無真人音檔時，會自動改用美式語音合成。</p>
   </div>
 </header>
 
@@ -218,115 +222,162 @@ function hl(text, chunks){
 }
 
 /* ============================================================
-   SPEECH ENGINE — Web Speech API, 英式口音 + 逐字高亮跟讀
+   SPEECH ENGINE
+   - 單字：抓 dictionaryapi.dev 的「真人美音」MP3 (Google 詞典音檔)
+           抓不到 → 退回瀏覽器 TTS (美式 en-US)
+   - 例句/搭配：瀏覽器 TTS (美式 en-US) + 逐字高亮跟讀
    ============================================================ */
 const Speech = (function(){
   const supported = ('speechSynthesis' in window) && ('SpeechSynthesisUtterance' in window);
   let voice = null;
-  let current = null;      // {btn, spans}
+  let current = null;        // {btn, spans}  (for TTS highlight)
+  let audioEl = null;        // shared <audio> for dictionary mp3
+  let audioBtn = null;       // btn currently playing mp3
+  const audioCache = {};     // word -> url | null(=none)
+
   function pickVoice(){
     if(!supported) return;
     const vs = speechSynthesis.getVoices();
     if(!vs.length) return;
-    // prefer en-GB, then any English
-    voice = vs.find(v=>/en-GB/i.test(v.lang))
-         || vs.find(v=>/en[-_]?GB|United Kingdom|British/i.test(v.name))
+    voice = vs.find(v=>/en-US/i.test(v.lang) && /google/i.test(v.name))
+         || vs.find(v=>/Samantha|Alex|Aaron|Nicky|Google US/i.test(v.name))
+         || vs.find(v=>/en-US/i.test(v.lang))
          || vs.find(v=>/^en/i.test(v.lang))
          || vs[0];
   }
-  if(supported){
-    pickVoice();
-    speechSynthesis.onvoiceschanged = pickVoice;
+  if(supported){ pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
+
+  function resetBtn(btn){
+    if(!btn) return;
+    btn.classList.remove('playing','loading');
+    const play=btn.querySelector('.ico-play'), stop=btn.querySelector('.ico-stop'), spin=btn.querySelector('.ico-spin');
+    if(play) play.style.display='';
+    if(stop) stop.style.display='none';
+    if(spin) spin.style.display='none';
+  }
+  function setState(btn, state){ // 'play'|'loading'|'playing'
+    if(!btn) return;
+    const play=btn.querySelector('.ico-play'), stop=btn.querySelector('.ico-stop'), spin=btn.querySelector('.ico-spin');
+    btn.classList.toggle('playing', state==='playing');
+    btn.classList.toggle('loading', state==='loading');
+    if(play) play.style.display = state==='play' ? '' : 'none';
+    if(spin) spin.style.display = state==='loading' ? '' : 'none';
+    if(stop) stop.style.display = state==='playing' ? '' : 'none';
   }
 
-  function clearHighlight(){
-    if(current){
-      current.spans.forEach(s=>s.classList.remove('spoken'));
-      current.btn.classList.remove('playing');
-      current.btn.querySelector('.ico-play').style.display='';
-      current.btn.querySelector('.ico-stop').style.display='none';
+  function stopAll(){
+    if(supported) speechSynthesis.cancel();
+    if(audioEl){ audioEl.pause(); }
+    if(current){ current.spans.forEach(s=>s.classList.remove('spoken')); resetBtn(current.btn); current=null; }
+    if(audioBtn){ resetBtn(audioBtn); audioBtn=null; }
+  }
+
+  /* ---- word-level: real-person US audio via dictionary API ---- */
+  async function fetchAudio(word){
+    const key = word.toLowerCase().replace(/[^a-z\- ]/g,'').trim();
+    if(key in audioCache) return audioCache[key];
+    try{
+      const r = await fetch('https://api.dictionaryapi.dev/api/v2/entries/en/'+encodeURIComponent(key), {mode:'cors'});
+      if(!r.ok) throw 0;
+      const data = await r.json();
+      let list=[];
+      data.forEach(e=>(e.phonetics||[]).forEach(p=>{ if(p.audio) list.push(p.audio); }));
+      // normalise protocol-relative urls
+      list = list.map(u=> u.startsWith('//') ? 'https:'+u : u);
+      const us = list.find(u=>/_us_|-us\.|\/us\//i.test(u));
+      const any = list[0];
+      audioCache[key] = us || any || null;
+    }catch(_){ audioCache[key] = null; }
+    return audioCache[key];
+  }
+
+  async function speakWord(word, btn){
+    if(audioBtn===btn){ stopAll(); return; }   // toggle
+    stopAll();
+    setState(btn,'loading');
+    let url=null;
+    try{ url = await fetchAudio(word); }catch(_){ url=null; }
+    if(url){
+      if(!audioEl){ audioEl=new Audio(); }
+      audioEl.src=url;
+      audioBtn=btn;
+      audioEl.onended=()=>{ if(audioBtn===btn){ resetBtn(btn); audioBtn=null; } };
+      audioEl.onerror=()=>{ // fallback to TTS
+        if(audioBtn===btn){ audioBtn=null; ttsFallbackWord(word, btn); }
+      };
+      setState(btn,'playing');
+      try{ await audioEl.play(); }
+      catch(_){ audioBtn=null; ttsFallbackWord(word, btn); }
+    }else{
+      ttsFallbackWord(word, btn);
     }
   }
-  function stop(){
-    if(supported) speechSynthesis.cancel();
-    clearHighlight();
-    current = null;
-  }
-
-  // Wrap each word of a .say element in .rw spans (once), keeping existing markup.
-  function prepare(sayEl){
-    if(sayEl.dataset.prepared) return;
-    const walker = document.createTreeWalker(sayEl, NodeFilter.SHOW_TEXT, null);
-    const textNodes = [];
-    let n; while((n=walker.nextNode())) textNodes.push(n);
-    textNodes.forEach(tn=>{
-      const parts = tn.nodeValue.split(/(\s+)/); // keep whitespace
-      const frag = document.createDocumentFragment();
-      parts.forEach(part=>{
-        if(part.trim()===''){ frag.appendChild(document.createTextNode(part)); }
-        else{
-          const sp = document.createElement('span');
-          sp.className = 'rw';
-          sp.textContent = part;
-          frag.appendChild(sp);
-        }
-      });
-      tn.parentNode.replaceChild(frag, tn);
-    });
-    sayEl.dataset.prepared = '1';
-  }
-
-  function speak(sayEl, btn){
-    if(!supported){ alert('您的瀏覽器不支援語音朗讀，請改用 Chrome / Edge / Safari。'); return; }
-    // toggle off if same button playing
-    if(current && current.btn===btn){ stop(); return; }
-    stop();
-    prepare(sayEl);
-    const spans = [...sayEl.querySelectorAll('.rw')];
-    const text = spans.map(s=>s.textContent).join(' ');
-
-    // build char-offset -> span index map for onboundary
-    const bounds = []; let acc = 0;
-    spans.forEach((s,i)=>{ bounds.push({start:acc, end:acc+s.textContent.length, i}); acc += s.textContent.length + 1; });
-
-    const u = new SpeechSynthesisUtterance(text);
-    if(voice) u.voice = voice;
-    u.lang = 'en-GB';
-    u.rate = 0.92;
-    u.pitch = 1.0;
-
-    let lastIdx = -1;
-    u.onboundary = (e)=>{
-      if(e.name && e.name!=='word') return;
-      const ci = e.charIndex;
-      const b = bounds.find(b=> ci>=b.start && ci<b.end) || bounds.find(b=> ci<=b.start);
-      if(b && b.i!==lastIdx){
-        if(lastIdx>=0 && spans[lastIdx]) spans[lastIdx].classList.remove('spoken');
-        spans[b.i].classList.add('spoken');
-        lastIdx = b.i;
-      }
-    };
-    u.onend = ()=>{ if(current && current.btn===btn) stop(); };
-    u.onerror = ()=>{ if(current && current.btn===btn) stop(); };
-
-    current = {btn, spans};
-    btn.classList.add('playing');
-    btn.querySelector('.ico-play').style.display='none';
-    btn.querySelector('.ico-stop').style.display='';
+  function ttsFallbackWord(word, btn){
+    if(!supported){ resetBtn(btn); return; }
+    const u=new SpeechSynthesisUtterance(word);
+    if(voice) u.voice=voice; u.lang='en-US'; u.rate=0.9;
+    setState(btn,'playing');
+    u.onend=()=>{ resetBtn(btn); };
+    u.onerror=()=>{ resetBtn(btn); };
+    // treat as current so stopAll clears it
+    current={btn, spans:[]};
     speechSynthesis.speak(u);
   }
 
-  return { supported, speak, stop };
+  /* ---- sentence-level: TTS en-US + read-along highlight ---- */
+  function prepare(sayEl){
+    if(sayEl.dataset.prepared) return;
+    const walker=document.createTreeWalker(sayEl, NodeFilter.SHOW_TEXT, null);
+    const tns=[]; let n; while((n=walker.nextNode())) tns.push(n);
+    tns.forEach(tn=>{
+      const parts=tn.nodeValue.split(/(\s+)/);
+      const frag=document.createDocumentFragment();
+      parts.forEach(part=>{
+        if(part.trim()===''){ frag.appendChild(document.createTextNode(part)); }
+        else{ const sp=document.createElement('span'); sp.className='rw'; sp.textContent=part; frag.appendChild(sp); }
+      });
+      tn.parentNode.replaceChild(frag,tn);
+    });
+    sayEl.dataset.prepared='1';
+  }
+  function speakSentence(sayEl, btn){
+    if(!supported){ alert('您的瀏覽器不支援整句朗讀，請改用 Chrome / Edge / Safari。'); return; }
+    if(current && current.btn===btn){ stopAll(); return; }
+    stopAll();
+    prepare(sayEl);
+    const spans=[...sayEl.querySelectorAll('.rw')];
+    const text=spans.map(s=>s.textContent).join(' ');
+    const bounds=[]; let acc=0;
+    spans.forEach((s,i)=>{ bounds.push({start:acc,end:acc+s.textContent.length,i}); acc+=s.textContent.length+1; });
+    const u=new SpeechSynthesisUtterance(text);
+    if(voice) u.voice=voice; u.lang='en-US'; u.rate=0.92;
+    let last=-1;
+    u.onboundary=(e)=>{
+      if(e.name && e.name!=='word') return;
+      const ci=e.charIndex;
+      const b=bounds.find(b=>ci>=b.start&&ci<b.end)||bounds.find(b=>ci<=b.start);
+      if(b && b.i!==last){ if(last>=0&&spans[last]) spans[last].classList.remove('spoken'); spans[b.i].classList.add('spoken'); last=b.i; }
+    };
+    u.onend=()=>{ if(current&&current.btn===btn) stopAll(); };
+    u.onerror=()=>{ if(current&&current.btn===btn) stopAll(); };
+    current={btn,spans};
+    setState(btn,'playing');
+    speechSynthesis.speak(u);
+  }
+
+  return { supported, speakWord, speakSentence, stopAll };
 })();
 
-/* speaker button markup */
-function speakBtn(){
-  return `<button type="button" class="speak-btn" aria-label="朗讀英文（英式發音）" title="朗讀（英式發音）">
+/* speaker button markup (adds a loading spinner icon) */
+function speakBtn(word){
+  const w = word ? ` data-word="${word.replace(/"/g,'&quot;')}"` : '';
+  return `<button type="button" class="speak-btn"${w} aria-label="朗讀（美式發音）" title="朗讀（美式真人發音）">
     <svg class="ico-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>
+    <svg class="ico-spin" style="display:none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9"/></svg>
     <svg class="ico-stop" style="display:none" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
   </button>`;
 }
-/* wrap an English string as a speakable line: <span class="say">text</span> + button */
+/* multi-word speakable line: text + sentence button */
 function say(htmlText){
   return `<span class="say-wrap inline-flex items-start gap-1.5"><span class="say">${htmlText}</span>${speakBtn()}</span>`;
 }
@@ -942,7 +993,7 @@ function derivedBlock(list){
     <p class="zh text-rose font-bold text-sm">📎 延伸字</p>
     ${list.map(d=>`
       <div class="rounded-xl border border-rose/20 bg-rosesoft/40 p-4">
-        <p class="mb-1"><span class="en font-bold text-rose inline-flex items-center gap-1.5"><span class="say">${d.word}</span>${speakBtn()}</span>
+        <p class="mb-1"><span class="en font-bold text-rose inline-flex items-center gap-1.5"><span class="say">${d.word}</span>${speakBtn(d.word)}</span>
           <span class="zh text-ink/60 text-sm"> ${d.pos} ${d.meaning}</span></p>
         <p class="en text-sm text-ink/90 mb-1"><span class="zh text-ink/50">例：</span>${say(d.exEn)}</p>
         <p class="zh text-sm text-ink/70 mb-1">中譯：${d.exZh}</p>
@@ -970,7 +1021,7 @@ function vocabCard(v, idx, prefix){
     <div class="p-5 sm:p-6">
       <div class="flex items-baseline gap-3 flex-wrap mb-3">
         <span class="font-display text-teal/70 text-sm font-semibold">${idx+1}</span>
-        <h3 class="en text-2xl font-bold text-ink inline-flex items-center gap-2"><span class="say">${v.headword}</span>${speakBtn()}</h3>
+        <h3 class="en text-2xl font-bold text-ink inline-flex items-center gap-2"><span class="say">${v.headword}</span>${speakBtn(v.headword)}</h3>
         ${posLine}
         <span class="zh text-ink/80 text-lg">${v.meaning}</span>
       </div>
@@ -1076,7 +1127,7 @@ function patternBlock(p, key){
         <p class="en text-sm text-ink/85 mb-3">${p.focus}</p>
         <p class="en text-sm text-ink/85"><span class="zh text-teal font-semibold">Form: </span>${p.form}</p>
         <div class="mt-3 space-y-1">
-          ${p.examples.map(e=>`<p class="en text-sm text-ink/80"><span class="zh text-rose font-semibold">Example: </span>${say(e)}</p>`).join('')}
+          ${p.examples.map(e=>`<p class="en text-sm text-ink/80"><span class="zh text-rose font-semibold">Example: </span>${e}</p>`).join('')}
         </div>
       </div>
 
@@ -1094,7 +1145,7 @@ function patternBlock(p, key){
         <div class="pt-2">
           <div class="rounded-xl bg-rosesoft/40 border border-rose/15 p-4">
             <ol class="space-y-2">
-              ${p.answers.map((a,i)=>`<li class="en text-sm text-ink/90 flex items-start gap-1.5"><span class="text-rose font-bold shrink-0">(${i+1})</span> <span class="say">${a}</span>${speakBtn()}</li>`).join('')}
+              ${p.answers.map((a,i)=>`<li class="en text-sm text-ink/90"><span class="text-rose font-bold">(${i+1})</span> ${a}</li>`).join('')}
             </ol>
           </div>
         </div>
@@ -1152,18 +1203,21 @@ document.getElementById('translation-content').innerHTML = `
 
 /* ---------- SPEAK + ACCORDION LOGIC ---------- */
 document.addEventListener('click', e=>{
-  // speaker button
   const sbtn = e.target.closest('.speak-btn');
   if(sbtn){
     e.preventDefault();
-    // the .say element is the previous sibling, or inside the same wrapper
-    let sayEl = sbtn.previousElementSibling && sbtn.previousElementSibling.classList.contains('say')
-                ? sbtn.previousElementSibling
-                : (sbtn.parentElement.querySelector('.say'));
-    if(sayEl) Speech.speak(sayEl, sbtn);
+    if(sbtn.dataset.word){
+      // single word → real-person US audio (dictionary API)
+      Speech.speakWord(sbtn.dataset.word, sbtn);
+    }else{
+      // sentence / collocation → US TTS with read-along
+      let sayEl = sbtn.previousElementSibling && sbtn.previousElementSibling.classList.contains('say')
+                  ? sbtn.previousElementSibling
+                  : (sbtn.parentElement.querySelector('.say'));
+      if(sayEl) Speech.speakSentence(sayEl, sbtn);
+    }
     return;
   }
-  // accordion
   const btn = e.target.closest('.acc-btn');
   if(!btn) return;
   const panel = document.getElementById(btn.dataset.target);
@@ -1173,8 +1227,7 @@ document.addEventListener('click', e=>{
   chev.classList.toggle('open', !isOpen);
 });
 
-/* stop speech if browser hidden */
-document.addEventListener('visibilitychange', ()=>{ if(document.hidden) Speech.stop(); });
+document.addEventListener('visibilitychange', ()=>{ if(document.hidden) Speech.stopAll(); });
 
 /* warn if unsupported */
 if(!Speech.supported){ document.getElementById('speech-warn').classList.remove('hidden'); }
